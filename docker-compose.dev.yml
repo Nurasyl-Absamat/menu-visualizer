@@ -1,0 +1,102 @@
+version: '3.8'
+
+services:
+  # Frontend - React with hot reload
+  web:
+    build: 
+      context: ./frontend
+      dockerfile: Dockerfile.dev
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=development
+      - CHOKIDAR_USEPOLLING=true
+    volumes:
+      - ./frontend/src:/app/src
+      - ./frontend/public:/app/public
+      - ./frontend/package.json:/app/package.json
+      - /app/node_modules
+    depends_on:
+      - api
+    networks:
+      - menu-network
+
+  # Backend - FastAPI with hot reload
+  api:
+    build: 
+      context: ./backend
+      dockerfile: Dockerfile.dev
+    ports:
+      - "8000:8000"
+    environment:
+      - MONGODB_URL=mongodb://mongo:27017
+      - MONGODB_DATABASE=menu_matcher
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_ACCESS_KEY=admin
+      - MINIO_SECRET_KEY=password123
+      - MINIO_BUCKET=menu-images
+      - CORS_ORIGINS=http://localhost:3000
+      - MAX_FILE_SIZE=5242880
+      - PYTHONPATH=/app
+    env_file:
+      - .env
+    volumes:
+      - ./backend:/app
+      - /app/__pycache__
+    depends_on:
+      - mongo
+      - minio
+    networks:
+      - menu-network
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+
+  # MongoDB database
+  mongo:
+    image: mongo:6
+    ports:
+      - "27018:27017"
+    environment:
+      - MONGO_INITDB_DATABASE=menu_matcher
+    volumes:
+      - mongo_data_dev:/data/db
+    networks:
+      - menu-network
+
+  # MinIO object storage
+  minio:
+    image: minio/minio:latest
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      - MINIO_ROOT_USER=admin
+      - MINIO_ROOT_PASSWORD=password123
+    volumes:
+      - minio_data_dev:/data
+    command: server /data --console-address ":9001"
+    networks:
+      - menu-network
+
+  # MinIO client to create initial bucket
+  minio-client:
+    image: minio/mc:latest
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      sleep 10;
+      /usr/bin/mc alias set myminio http://minio:9000 admin password123;
+      /usr/bin/mc mb myminio/menu-images --ignore-existing;
+      /usr/bin/mc policy set public myminio/menu-images;
+      exit 0;
+      "
+    networks:
+      - menu-network
+
+volumes:
+  mongo_data_dev:
+  minio_data_dev:
+
+networks:
+  menu-network:
+    driver: bridge 
