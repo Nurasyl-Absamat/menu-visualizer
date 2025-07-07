@@ -1,10 +1,12 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File, Depends
+from fastapi import FastAPI, HTTPException, UploadFile, File, Depends, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import os
 from dotenv import load_dotenv
 import logging
 from contextlib import asynccontextmanager
+import asyncio
+from typing import Dict, Any
 
 from services.database import DatabaseService
 from services.ocr import OCRService
@@ -26,6 +28,9 @@ ocr_service = None
 matching_service = None
 image_search_service = None
 storage_service = None
+
+# Background task status tracking
+background_tasks_status: Dict[str, Dict[str, Any]] = {}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -71,21 +76,98 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+async def process_images_background(session_id: str, enhanced_matches: list):
+    """Background task to process images for all products"""
+    try:
+        logger.info(f"Starting background image processing for session {session_id}")
+        
+        # Update status
+        background_tasks_status[session_id] = {
+            "status": "processing_images",
+            "progress": 0,
+            "total": len(enhanced_matches),
+            "completed": 0,
+            "error": None
+        }
+        
+        # Process images in parallel for better performance
+        async def process_single_product(match_index: int, match: dict):
+            try:
+                # Use English name for image search if available, otherwise use original name
+                search_name = match["nameEnglish"] if match["nameEnglish"] else match["name"]
+                logger.info(f"Searching for images for product: '{match['name']}' using search term: '{search_name}'")
+                
+                # Get multiple images (3 by default)
+                images = await image_search_service.search_product_images(search_name, count=3)
+                match["images"] = images
+                
+                # Keep backward compatibility with single image_url
+                if images and len(images) > 0:
+                    match["image_url"] = images[0]["url"]
+                else:
+                    match["image_url"] = None
+                
+                # Update progress
+                background_tasks_status[session_id]["completed"] += 1
+                background_tasks_status[session_id]["progress"] = (
+                    background_tasks_status[session_id]["completed"] / 
+                    background_tasks_status[session_id]["total"] * 100
+                )
+                
+                logger.info(f"✅ Processed images for '{match['name']}' ({background_tasks_status[session_id]['completed']}/{background_tasks_status[session_id]['total']})")
+                
+            except Exception as e:
+                logger.error(f"Error processing images for product '{match['name']}': {e}")
+                # Set placeholder images on error
+                match["images"] = [{
+                    "url": f"https://via.placeholder.com/400x300/e5e7eb/6b7280?text={match['name'].replace(' ', '+')}",
+                    "source": "placeholder",
+                    "photographer": "System Generated",
+                    "photographer_url": None
+                }] * 3
+                match["image_url"] = match["images"][0]["url"]
+        
+        # Process all products in parallel
+        tasks = []
+        for i, match in enumerate(enhanced_matches):
+            task = asyncio.create_task(process_single_product(i, match))
+            tasks.append(task)
+        
+        # Wait for all tasks to complete
+        await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Update session in database with processed images
+        session_data = await db_service.get_session(session_id)
+        if session_data:
+            session_data["matches"] = enhanced_matches
+            # Update the session document
+            await db_service.update_session(session_id, {"matches": enhanced_matches})
+        
+        # Mark as completed
+        background_tasks_status[session_id]["status"] = "completed"
+        background_tasks_status[session_id]["progress"] = 100
+        
+        logger.info(f"✅ Background image processing completed for session {session_id}")
+        
+    except Exception as e:
+        logger.error(f"Background image processing failed for session {session_id}: {e}")
+        background_tasks_status[session_id]["status"] = "error"
+        background_tasks_status[session_id]["error"] = str(e)
+
 # Health check endpoint
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
     return {"status": "healthy", "message": "Menu Visualizer API is running"}
 
-# Main image processing endpoint
+# Main image processing endpoint - now returns immediate OCR results
 @app.post("/parse-image", response_model=ProcessImageResponse)
-async def parse_image(file: UploadFile = File(...)):
+async def parse_image(file: UploadFile = File(...), background_tasks: BackgroundTasks = BackgroundTasks()):
     """
     Process uploaded menu image:
-    1. Extract structured data using OCR
-    2. Match products against catalog
-    3. Fetch product images
-    4. Store results
+    1. Extract structured data using OCR (immediate response)
+    2. Start background task for image processing
+    3. Return OCR results immediately
     """
     try:
         # Validate file
@@ -110,6 +192,7 @@ async def parse_image(file: UploadFile = File(...)):
         await file.seek(0)
         
         # Extract structured data using OCR
+        logger.info("Starting OCR processing...")
         structured_ocr = await ocr_service.extract_structured_data(file)
         
         # Check for OCR errors
@@ -135,7 +218,7 @@ async def parse_image(file: UploadFile = File(...)):
         # Match products against catalog
         matches = await matching_service.match_products(product_names)
         
-        # Enhance matches with OCR details
+        # Enhance matches with OCR details (without images initially)
         enhanced_matches = []
         for i, match in enumerate(matches):
             # Find corresponding OCR product
@@ -143,14 +226,15 @@ async def parse_image(file: UploadFile = File(...)):
             if i < len(ocr_products):
                 ocr_product = ocr_products[i]
             
-            # Create enhanced match
+            # Create enhanced match without images initially
             enhanced_match = {
                 "name": match["name"],
                 "nameEnglish": ocr_product.get("nameEnglish", "") if ocr_product else "",
                 "matched": match["matched"],
                 "confidence": match.get("confidence"),
                 "product_id": match.get("product_id"),
-                "image_url": None,  # Will be populated below
+                "image_url": None,  # Will be populated by background task
+                "images": [],  # Will be populated by background task
                 "price": ocr_product.get("price", "") if ocr_product else "",
                 "description": ocr_product.get("description", "") if ocr_product else "",
                 "parsingError": ocr_product.get("parsingError", "") if ocr_product else ""
@@ -158,33 +242,23 @@ async def parse_image(file: UploadFile = File(...)):
             
             enhanced_matches.append(enhanced_match)
         
-        # Fetch multiple images for ALL products using English names (not just matched ones)
-        for match in enhanced_matches:
-            # Use English name for image search if available, otherwise use original name
-            search_name = match["nameEnglish"] if match["nameEnglish"] else match["name"]
-            logger.info(f"Searching for images for product: '{match['name']}' using search term: '{search_name}'")
-            
-            # Get multiple images (3 by default)
-            images = await image_search_service.search_product_images(search_name, count=3)
-            match["images"] = images
-            
-            # Keep backward compatibility with single image_url
-            if images and len(images) > 0:
-                match["image_url"] = images[0]["url"]
-            else:
-                match["image_url"] = None
-        
-        # Store session results with structured data
+        # Store initial session results without images
         session_data = {
             "image_path": image_path,
             "raw_ocr_text": "",  # Legacy field - keep for compatibility
             "parsed_items": product_names,
             "matches": enhanced_matches,
-            "structured_ocr": structured_ocr
+            "structured_ocr": structured_ocr,
+            "images_processed": False
         }
         
         session_id = await db_service.store_session(session_data)
         
+        # Start background image processing
+        logger.info(f"Starting background image processing for session {session_id}")
+        background_tasks.add_task(process_images_background, session_id, enhanced_matches)
+        
+        # Return immediate response with OCR results
         return ProcessImageResponse(
             session_id=session_id,
             items=enhanced_matches,
@@ -197,6 +271,40 @@ async def parse_image(file: UploadFile = File(...)):
         raise
     except Exception as e:
         logger.error(f"Error processing image: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+# New endpoint to check session status and get updated results
+@app.get("/session/{session_id}/status")
+async def get_session_status(session_id: str):
+    """Get session processing status and updated results"""
+    try:
+        # Get session from database
+        session_data = await db_service.get_session(session_id)
+        if not session_data:
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        # Get background task status
+        task_status = background_tasks_status.get(session_id, {
+            "status": "completed" if session_data.get("images_processed", False) else "not_started",
+            "progress": 100 if session_data.get("images_processed", False) else 0,
+            "total": len(session_data.get("matches", [])),
+            "completed": len(session_data.get("matches", [])) if session_data.get("images_processed", False) else 0,
+            "error": None
+        })
+        
+        return {
+            "session_id": session_id,
+            "processing_status": task_status,
+            "items": session_data.get("matches", []),
+            "total_items": len(session_data.get("matches", [])),
+            "matched_items": len([m for m in session_data.get("matches", []) if m.get("matched", False)]),
+            "ocr_error": session_data.get("structured_ocr", {}).get("error")
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting session status: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 # Get products from catalog

@@ -174,4 +174,21 @@ class DatabaseService:
             return self.sessions_collection.find_one({"_id": session_id})
         except Exception as e:
             logger.error(f"Error fetching session {session_id}: {e}")
+            raise
+    
+    async def update_session(self, session_id: str, update_data: Dict) -> bool:
+        """Update OCR session data"""
+        try:
+            result = self.sessions_collection.update_one(
+                {"_id": session_id}, 
+                {"$set": update_data}
+            )
+            if result.modified_count > 0:
+                logger.info(f"Updated session: {session_id}")
+                return True
+            else:
+                logger.warning(f"No session found to update: {session_id}")
+                return False
+        except Exception as e:
+            logger.error(f"Error updating session {session_id}: {e}")
             raise 

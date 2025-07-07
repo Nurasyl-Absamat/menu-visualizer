@@ -116,7 +116,7 @@ class OCRService:
                         ]
                     }
                 ],
-                max_tokens=2000,
+                max_tokens=4000,
                 temperature=0.1,
                 response_format={"type": "json_object"}
             )
@@ -166,9 +166,14 @@ class OCRService:
             except json.JSONDecodeError as e:
                 logger.error(f"Failed to parse JSON response: {e}")
                 logger.error(f"Raw response: {response_content}")
+                
+                # Check if response was truncated
+                if len(response_content) > 7000:
+                    logger.warning("Response appears to be truncated - consider increasing max_tokens")
+                
                 return {
                     "products": [],
-                    "error": f"Failed to parse menu data - invalid response format"
+                    "error": f"Failed to parse menu data - response may be truncated. Try with a smaller menu image or contact support."
                 }
             
         except openai.APIError as e:
